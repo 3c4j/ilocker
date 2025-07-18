@@ -3,7 +3,6 @@ package ilocker
 import (
 	"context"
 	"errors"
-	"github.com/nfangxu/ilocker"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,7 +19,7 @@ type meta struct {
 	released  bool         // whether the lock is released by UnLock
 }
 
-func NewMeta(id string, ttl time.Duration) ilocker.ILocked {
+func NewMeta(id string, ttl time.Duration) ILocked {
 	m := &meta{
 		id:        id,
 		releaseAt: time.Now().Add(ttl),
@@ -68,7 +67,7 @@ type MemoryLocker struct {
 // The locker will auto delete lock in another goroutine,
 // and the check interval is 10ms by default.
 // Please don't call the callback function unless the application will be exited.
-func NewMemoryLocker(interval time.Duration) (ilocker.ILocker, func(), error) {
+func NewMemoryLocker(interval time.Duration) (ILocker, func(), error) {
 	if interval <= 0 {
 		interval = 10 * time.Microsecond
 	}
@@ -86,7 +85,7 @@ func NewMemoryLocker(interval time.Duration) (ilocker.ILocker, func(), error) {
 	}, nil
 }
 
-func (l *MemoryLocker) Lock(ctx context.Context, id string, ttl time.Duration) (ilocker.ILocked, error) {
+func (l *MemoryLocker) Lock(ctx context.Context, id string, ttl time.Duration) (ILocked, error) {
 	locked, ok := l.locked.Load(id)
 	if ok {
 		_locked := locked.(*meta)
@@ -127,12 +126,16 @@ func (l *MemoryLocker) Locking(ctx context.Context, id string) bool {
 }
 
 func (l *MemoryLocker) UnLock(ctx context.Context, id string) error {
-	locked, ok := l.locked.Load(id)
+	ld, ok := l.locked.Load(id)
+	if !ok {
+		return nil
+	}
+	_locked, ok := ld.(*meta)
 	if !ok {
 		return nil
 	}
 
-	return locked.(*meta).UnLock(ctx)
+	return _locked.UnLock(ctx)
 }
 
 func (l *MemoryLocker) cleanup(c <-chan time.Time) {
