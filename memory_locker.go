@@ -3,7 +3,9 @@ package ilocker
 import (
 	"context"
 	"errors"
+	"github.com/nfangxu/ilocker"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,111 +13,145 @@ var (
 	ErrHasLocked = errors.New("locked")
 )
 
-func newMeta(id string, releasedAt time.Time) *meta {
-	return &meta{
-		id:         id,
-		releasedAt: releasedAt,
-		mu:         &sync.RWMutex{},
-	}
-}
-
 type meta struct {
-	id         string
-	releasedAt time.Time
-	mu         *sync.RWMutex
+	id        string
+	mu        sync.RWMutex // the mutex to protect released and releaseAt
+	releaseAt time.Time    // the time that lock will be released automatically
+	released  bool         // whether the lock is released by UnLock
 }
 
-func (m *meta) isExpired() bool {
-	return m.releasedAt.Before(time.Now())
+func NewMeta(id string, ttl time.Duration) ilocker.ILocked {
+	m := &meta{
+		id:        id,
+		releaseAt: time.Now().Add(ttl),
+	}
+
+	return m
 }
 
-// Refresh the meta if the meta is expired
-func (m *meta) Refresh(releasedAt time.Time) bool {
+func (m *meta) Locking(ctx context.Context) bool {
+	return !m.IsReleased()
+}
+
+func (m *meta) UnLock(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// if the meta is not expired, return false
-	if !m.isExpired() {
-		return false
-	}
-	// if the meta is expired, update the meta, return true
-	m.releasedAt = releasedAt
-	return true
-}
-
-// MemoryLocker is a simple in-memory implementation of the Locker interface.
-type MemoryLocker struct {
-	locks *sync.Map
-}
-
-func NewMemoryLocker(d time.Duration) ILocker {
-	if d == 0 {
-		d = time.Minute
-	}
-	locks := &sync.Map{}
-	l := &MemoryLocker{locks: locks}
-	go func(_l *MemoryLocker) {
-		for {
-			select {
-			case <-time.After(d):
-				locks.Range(func(key, value interface{}) bool {
-					_m, ok := value.(*meta)
-					if !ok {
-						locks.Delete(key)
-					}
-					if _m.isExpired() {
-						_ = _l.UnLock(context.Background(), _m.id)
-					}
-					return true
-				})
-			}
-		}
-	}(l)
-	return l
-}
-
-func (m *MemoryLocker) Lock(ctx context.Context, id string, ttl time.Duration) (ILocked, error) {
-	now := time.Now()
-	value, ok := m.locks.LoadOrStore(id, newMeta(id, now.Add(ttl)))
-	// If the key is not loaded, it is new, and we can lock it.
-	if !ok {
-		return Locked(m, id)
-	}
-	_m, ok := value.(*meta)
-	// Retry if the value is not *meta
-	if !ok {
-		return m.Retry(ctx, id, ttl)
-	}
-	// Refresh the meta if the meta is expired
-	if ok = _m.Refresh(now.Add(ttl)); !ok {
-		return nil, ErrHasLocked
-	}
-	return Locked(m, id)
-}
-
-func (m *MemoryLocker) Locking(ctx context.Context, id string) bool {
-	ld, ok := m.locks.Load(id)
-	if !ok || ld == nil {
-		return false
-	}
-	_m, ok := ld.(*meta)
-	if !ok {
-		return false
-	}
-	_m.mu.RLock()
-	defer _m.mu.RUnlock()
-	if _m.releasedAt.Before(time.Now()) {
-		_ = m.UnLock(ctx, id)
-		return false
-	}
-	return true
-}
-
-func (m *MemoryLocker) UnLock(ctx context.Context, id string) error {
-	m.locks.Delete(id)
+	m.released = true
 	return nil
 }
 
-func (m *MemoryLocker) Retry(ctx context.Context, id string, ttl time.Duration) (ILocked, error) {
-	m.locks.Delete(id)
-	return m.Lock(ctx, id, ttl)
+func (m *meta) IsReleased() bool {
+	if !m.mu.TryLock() { // if lock failed, then return false
+		return false
+	}
+	defer m.mu.Unlock()
+	return m.released || m.releaseAt.Before(time.Now())
+}
+
+func (m *meta) Refresh(ttl time.Duration) error {
+	if !m.mu.TryLock() {
+		return ErrHasLocked
+	}
+	defer m.mu.Unlock()
+	m.releaseAt = time.Now().Add(ttl)
+	m.released = false
+	return nil
+}
+
+type MemoryLocker struct {
+	locked           sync.Map // map[string]*meta
+	mu               sync.Map // map[string]*sync.RWMutex
+	cleanupIsRunning atomic.Bool
+}
+
+// NewMemoryLocker The locker is implemented in memory.
+// The locker will auto delete lock in another goroutine,
+// and the check interval is 10ms by default.
+// Please don't call the callback function unless the application will be exited.
+func NewMemoryLocker(interval time.Duration) (ilocker.ILocker, func(), error) {
+	if interval <= 0 {
+		interval = 10 * time.Microsecond
+	}
+	l := &MemoryLocker{
+		locked:           sync.Map{},
+		mu:               sync.Map{},
+		cleanupIsRunning: atomic.Bool{},
+	}
+
+	// start a goroutine to clean up expired locks.
+	go l.cleanup(time.Tick(interval))
+
+	return l, func() {
+		l.cleanupIsRunning.Store(false)
+	}, nil
+}
+
+func (l *MemoryLocker) Lock(ctx context.Context, id string, ttl time.Duration) (ilocker.ILocked, error) {
+	locked, ok := l.locked.Load(id)
+	if ok {
+		_locked := locked.(*meta)
+		if _locked.Locking(ctx) {
+			return nil, ErrHasLocked
+		}
+
+		// If the lock is released but not released by locker,
+		// then try to extend the lock that update the releaseAt.
+		if err := _locked.Refresh(ttl); err == nil {
+			return _locked, nil
+		}
+	}
+
+	// Use sync.RWMutex to lock the id
+	mu, _ := l.mu.LoadOrStore(id, &sync.RWMutex{})
+	_mu, _ := mu.(*sync.RWMutex)
+	if !_mu.TryLock() {
+		return nil, ErrHasLocked
+	}
+
+	// TODO: Which defer is executed first? Why?
+	defer l.mu.Delete(id)
+	defer _mu.Unlock()
+
+	newLock := NewMeta(id, ttl)
+	l.locked.Store(id, newLock)
+	return newLock, nil
+}
+
+func (l *MemoryLocker) Locking(ctx context.Context, id string) bool {
+	locked, ok := l.locked.Load(id)
+	if !ok {
+		return false
+	}
+
+	return locked.(*meta).Locking(ctx)
+}
+
+func (l *MemoryLocker) UnLock(ctx context.Context, id string) error {
+	locked, ok := l.locked.Load(id)
+	if !ok {
+		return nil
+	}
+
+	return locked.(*meta).UnLock(ctx)
+}
+
+func (l *MemoryLocker) cleanup(c <-chan time.Time) {
+	// ticker don't close the channel, so we need to check the running status.
+	l.cleanupIsRunning.Store(true)
+	for {
+		if !l.cleanupIsRunning.Load() {
+			return
+		}
+
+		select {
+		case <-c:
+			l.locked.Range(func(key, value any) bool {
+				locked, ok := value.(*meta)
+				if !ok || locked.IsReleased() {
+					l.locked.Delete(key)
+				}
+				return true
+			})
+		}
+	}
 }

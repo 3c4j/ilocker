@@ -12,7 +12,11 @@ import (
 )
 
 func main() {
-	locker := ilocker.NewMemoryLocker(time.Minute)
+	locker, closeFn, err := ilocker.NewMemoryLocker(time.Second)
+	if err != nil {
+		panic(err)
+	}
+	defer closeFn()
 	ld, err := locker.Lock(context.TODO(), "foo", time.Second)
 	if err != nil {
 		panic(err)

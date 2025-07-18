@@ -8,83 +8,104 @@ import (
 	"time"
 )
 
-func TestMemoryLocker_Lock(t *testing.T) {
-	l := NewMemoryLocker(0)
-	ctx := context.Background()
-	ld1, err := l.Lock(ctx, "foo", time.Second)
-	assert.NoErrorf(t, err, "Lock() should not return error")
-	assert.True(t, ld1.Locking(ctx), "Locking() should return true")
+func TestCleanupGoroutine(t *testing.T) {
+	locker, fn, err := NewMemoryLocker(0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(time.Second)
-	assert.False(t, ld1.Locking(ctx), "Locking() should return false")
-
-	ld2, err := l.Lock(ctx, "bar", time.Second)
-	assert.NoErrorf(t, err, "Lock() should not return error")
-	assert.True(t, ld2.Locking(ctx), "Locking() should return true")
-	err = ld2.UnLock(ctx)
-	assert.NoErrorf(t, err, "UnLock() should not return error")
-	assert.False(t, ld2.Locking(ctx), "Locking() should return false")
-
-	ld3, err := l.Lock(ctx, "baz", time.Second)
-	assert.NoErrorf(t, err, "Lock() should not return error")
-	assert.True(t, ld3.Locking(ctx), "Locking() should return true")
-	_, err = l.Lock(ctx, "baz", time.Second)
-	assert.Error(t, err, "Lock() should return error")
-	time.Sleep(time.Second * 2)
-	now := time.Now()
-	_, err = l.Lock(ctx, "baz", time.Second)
-	assert.NoErrorf(t, err, "Lock() should not return error")
-	_l := l.(*MemoryLocker)
-	_m, ok := _l.locks.Load("baz")
-	assert.True(t, ok, "locks should contain key baz")
-	m := _m.(*meta)
-	assert.True(t, m.releasedAt.After(now), "releasedAt should be after now")
+	_locker := locker.(*MemoryLocker)
+	assert.True(t, _locker.cleanupIsRunning.Load(), "check goroutine is not running")
+	fn()
+	time.Sleep(time.Second)
+	assert.False(t, _locker.cleanupIsRunning.Load(), "check goroutine is running")
 }
 
-func TestMemoryLocker_Lock_Async(t *testing.T) {
-	l := NewMemoryLocker(0)
-	ctx := context.Background()
+func TestReleaseWithExpired(t *testing.T) {
+	locker, fn, err := NewMemoryLocker(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fn()
+
+	ctx := context.TODO()
+	locked, err := locker.Lock(ctx, "test", 3*time.Second)
+	assert.Nil(t, err, "lock failed")
+	assert.True(t, locked.Locking(ctx), "locked but locking is false")
+
+	time.Sleep(4 * time.Second)
+
+	assert.False(t, locked.Locking(ctx), "lock is expired but not release")
+	assert.False(t, locker.Locking(ctx, "test"), "lock is expired but not release")
+}
+
+func TestLocking(t *testing.T) {
+	locker, fn, err := NewMemoryLocker(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fn()
+
+	ctx := context.TODO()
+	// Lock
+	locked, err := locker.Lock(ctx, "test", 3*time.Second)
+	assert.Nil(t, err, "lock failed at first time")
+	assert.True(t, locked.Locking(ctx), "locked but locking is false at first time")
+
+	// lock again
+	_, err = locker.Lock(ctx, "test", 3*time.Second)
+	assert.Equal(t, ErrHasLocked, err, "lock is exist, and lock again should be failed")
+
+	// Release lock using 'ilocker.ILocked'
+	err = locked.UnLock(ctx)
+	assert.Nil(t, err, "release lock using 'locked' failed")
+
+	// lock again
+	locked, err = locker.Lock(ctx, "test", 3*time.Second)
+	assert.Nil(t, err, "lock failed at second time")
+	assert.True(t, locked.Locking(ctx), "locked but locking is false at second time")
+
+	// Release lock using 'ilocker.ILocker'
+	err = locker.UnLock(ctx, "test")
+	assert.Nil(t, err, "release lock using 'locker' failed")
+
+	// lock again
+	locked, err = locker.Lock(ctx, "test", 3*time.Second)
+	assert.Nil(t, err, "lock failed at third time")
+	assert.True(t, locked.Locking(ctx), "locked but locking is false at third time")
+}
+
+func TestLocking_Async(t *testing.T) {
+	locker, fn, err := NewMemoryLocker(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fn()
+
+	ctx := context.TODO()
 
 	wg := sync.WaitGroup{}
-	wg.Add(2)
-	go func(_wg *sync.WaitGroup) {
-		ld1, err := l.Lock(ctx, "foo", time.Second)
-		assert.NoErrorf(t, err, "Lock() should not return error")
-		assert.True(t, ld1.Locking(ctx), "Locking() should return true")
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		locked, err := locker.Lock(ctx, "test", 3*time.Second)
+		assert.Nil(t, err, "lock failed")
+		assert.True(t, locked.Locking(ctx), "locked but locking is false at first goroutine")
+	}()
+
+	go func() {
+		defer wg.Done()
 		time.Sleep(time.Second)
-		assert.False(t, ld1.Locking(ctx), "Locking() should return false")
-		_wg.Done()
-	}(&wg)
-	go func(_wg *sync.WaitGroup) {
-		time.Sleep(time.Second / 2)
-		_, err := l.Lock(ctx, "foo", time.Second)
-		assert.EqualError(t, err, ErrHasLocked.Error(), "Lock() should return ErrHasLocked")
-		time.Sleep(time.Second)
-		ld2, err := l.Lock(ctx, "foo", time.Second)
-		assert.True(t, ld2.Locking(ctx), "Locking() should return true")
-		err = ld2.UnLock(ctx)
-		assert.NoErrorf(t, err, "UnLock() should not return error")
-		assert.False(t, ld2.Locking(ctx), "Locking() should return false")
-		_wg.Done()
-	}(&wg)
+		_, err := locker.Lock(ctx, "test", 3*time.Second)
+		assert.Equal(t, ErrHasLocked, err, "lock is exist in first goroutine, and lock again should be failed")
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(time.Second * 4)
+		_, err := locker.Lock(ctx, "test", 3*time.Second)
+		assert.Nil(t, err, "lock is release with 3 seconds, and lock again should be success")
+	}()
+
 	wg.Wait()
-}
-
-func TestMemoryLocker_Clean(t *testing.T) {
-	l := NewMemoryLocker(time.Second)
-	ctx := context.Background()
-	_, err := l.Lock(ctx, "clean", time.Second)
-	assert.NoErrorf(t, err, "Lock() should not return error")
-
-	_l := l.(*MemoryLocker)
-	_, ok := _l.locks.Load("clean")
-	assert.True(t, ok, "locks.Load() should return true")
-	time.Sleep(time.Second * 2)
-	_, ok = _l.locks.Load("clean")
-	assert.False(t, ok, "locks.Load() should return false")
-
-	// Clean another one
-	l.Lock(ctx, "clean", time.Second)
-	time.Sleep(time.Second * 2)
-	_, ok = _l.locks.Load("clean")
-	assert.False(t, ok, "locks.Load() should return false")
 }
